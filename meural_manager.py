@@ -538,17 +538,43 @@ class Meural(object):
 
     def is_in_gallery(self, gallery_id, item_id):
         """Check membership directly. A write that times out may still have
-        been applied server-side, so ask rather than assume."""
+        been applied server-side, so ask rather than assume.
+
+        True, False, or None when the API would not say. Every page is read,
+        not just the first: a playlist can hold more items than one page
+        returns, and stopping early reports False for an item that is there.
+        """
+        page = 1
+        while True:
+            response = self.request(
+                "GET", "/galleries/{}/items".format(gallery_id),
+                params={"count": PAGE_SIZE, "page": page}, quiet=True)
+            if response is None or response.status_code != 200:
+                return None                            # genuinely unknown
+            try:
+                data = response.json()
+            except ValueError:
+                return None
+            for row in data.get("data", []):
+                if row.get("id") == item_id:
+                    return True
+            if data.get("isLast", True):
+                return False
+            page += 1
+            time.sleep(READ_DELAY)
+
+    def remove_from_gallery(self, gallery_id, item_id):
+        """Detach an item from a playlist, leaving the item itself alone.
+
+        The exact counterpart of add_to_gallery. Not to be confused with
+        delete_item, which destroys the upload and therefore removes it from
+        every playlist at once.
+        """
         response = self.request(
-            "GET", "/galleries/{}/items".format(gallery_id),
-            params={"count": PAGE_SIZE, "page": 1}, quiet=True)
-        if response is None or response.status_code != 200:
-            return None                                # genuinely unknown
-        try:
-            rows = response.json().get("data", [])
-        except ValueError:
-            return None
-        return any(row.get("id") == item_id for row in rows)
+            "DELETE", "/galleries/{}/items/{}".format(gallery_id, item_id),
+            headers={"Content-Type": "application/json", "Accept": "*/*"},
+            timeout=MEMBER_TIMEOUT)
+        return None if response is None else response.status_code
 
     def add_to_device(self, device_id, item_id):
         response = self.request(
@@ -980,6 +1006,150 @@ def cmd_upload(api, args):
             print("Resume state cleared.")
 
 
+def cmd_move(api, args):
+    orphans, _ = playlist_table(api)
+
+    if args.source is None:
+        sys.exit("Choose a source with --from N, or --from o for the items in "
+                 "no playlist.")
+    if args.destination is None and args.to_new is None:
+        sys.exit("Choose a destination with --to N or --to-new NAME.")
+
+    # -- source: a numbered playlist, or the orphans pseudo-playlist ---------
+    source_gallery = None
+    if str(args.source).strip().lower() == "o":
+        moving = list(orphans)
+        source_label = "the items in no playlist"
+    else:
+        try:
+            number = int(args.source)
+        except ValueError:
+            sys.exit("--from takes a playlist number, or o for the items in "
+                     "no playlist; got {!r}.".format(args.source))
+        if not 1 <= number <= len(api.galleries):
+            sys.exit("No playlist numbered {}.".format(number))
+        if number == args.destination:
+            sys.exit("Source and destination are the same playlist.")
+        source_gallery = api.galleries[number - 1]
+        moving = list(source_gallery.get("itemIds", []))
+        source_label = "{} (playlist {})".format(
+            source_gallery.get("name", "(unnamed)"), number)
+
+    if not moving:
+        print("\nNothing in {}. Nothing to move.".format(source_label))
+        return
+
+    # -- destination --------------------------------------------------------
+    if args.destination is not None:
+        if not 1 <= args.destination <= len(api.galleries):
+            sys.exit("No playlist numbered {}.".format(args.destination))
+        destination_gallery = api.galleries[args.destination - 1]
+        destination_label = "{} (playlist {})".format(
+            destination_gallery.get("name", "(unnamed)"), args.destination)
+        present = set(destination_gallery.get("itemIds", []))
+    else:
+        destination_gallery = None                     # created on --execute
+        destination_label = "new playlist {!r}".format(args.to_new)
+        present = set()
+
+    # Copying never empties the source; neither does moving out of the orphans
+    # pseudo-playlist, since there is no playlist to detach from - an orphan
+    # stops being an orphan the moment it lands somewhere.
+    detach = not args.copy and source_gallery is not None
+
+    print("\n{} {} item(s)".format("Copy" if args.copy else "Move", len(moving)))
+    print("  from: {}".format(source_label))
+    print("  to:   {}".format(destination_label))
+
+    arriving = [i for i in moving if i not in present]
+    if len(arriving) < len(moving):
+        print("  {} item(s) already in the destination, so they are {}"
+              .format(len(moving) - len(arriving),
+                      "only removed from the source" if detach
+                      else "left alone"))
+    if args.copy:
+        print("  --copy: nothing is removed from the source")
+    elif source_gallery is None:
+        print("  the source is not a playlist, so there is nothing to remove "
+              "from")
+
+    outside = set(moving) - {item["id"] for item in api.items}
+    if outside:
+        print("  {} item(s) are Meural artwork rather than your uploads; they "
+              "move the same way".format(len(outside)))
+
+    print("\nNo image is deleted - this changes playlist membership only. Each "
+          "item is added to\nthe destination and removed from the source only "
+          "once that has been confirmed, so\nan interruption leaves it in both "
+          "playlists rather than in neither.")
+
+    if not args.execute:
+        print("\nDry run. Add --execute to carry this out.")
+        return
+
+    destination_id = (destination_gallery["id"] if destination_gallery
+                      else api.create_gallery(args.to_new))
+
+    failures, both = [], []
+    started = time.time()
+
+    for index, item_id in enumerate(moving, start=1):
+        print("({}/{}) item {}".format(index, len(moving), item_id))
+
+        if item_id in present:
+            print("    already in the destination")
+            arrived = True
+        else:
+            status = api.add_to_gallery(destination_id, item_id)
+            if status is None:
+                # The API never answered. The add may have been applied all the
+                # same, and this decides whether the source is touched, so ask.
+                print("    no answer, verifying")
+                verified = api.is_in_gallery(destination_id, item_id)
+                if verified is True:
+                    print("    verified: it went through after all")
+                    status = 200
+                elif verified is False:
+                    print("    verified: not added - retrying once")
+                    status = api.add_to_gallery(destination_id, item_id)
+                else:
+                    print("    could not verify; leaving it where it is")
+            print("    -> destination: {}".format(status))
+            arrived = status in (200, 201, 204)
+
+        if not arrived:
+            failures.append(item_id)
+            time.sleep(WRITE_DELAY)
+            continue
+
+        if detach:
+            # 404 means it is already detached, which a re-run can produce.
+            status = api.remove_from_gallery(source_gallery["id"], item_id)
+            print("    <- source: {}".format(status))
+            if status not in (200, 204, 404):
+                both.append(item_id)
+
+        time.sleep(WRITE_DELAY)
+
+    total = time.time() - started
+    print("\nFinished in {:.0f}m {:.0f}s.".format(total // 60, total % 60))
+    print("{} item(s) in {}.".format(len(moving) - len(failures),
+                                     destination_label))
+
+    if both:
+        print("\n{} item(s) arrived but could not be removed from the source, "
+              "so they sit in\nboth playlists: {}".format(len(both), both[:20]))
+        print("Re-run the same command to retry the removal.")
+
+    if failures:
+        print("\n{} item(s) could not be added, and were left where they are: "
+              "{}".format(len(failures), failures[:20]))
+        print("Re-run the same command to retry only those.")
+
+    if not both and not failures:
+        print("Done.")
+
+
 def cmd_delete(api, args):
     orphans, _ = playlist_table(api)
     item_ids = {item["id"] for item in api.items}
@@ -1092,6 +1262,7 @@ Run without a command to list your playlists.
   meural.py                                  what is in my library?
   meural.py export --download ~/backup       save everything first
   meural.py upload ~/Pictures --new "May" --resize --execute
+  meural.py move --from 2 --to 5 --execute   reshuffle playlists
   meural.py delete --orphans --execute       tidy up
 
 Nothing is changed without --execute. `meural.py <command> --help` has
@@ -1170,6 +1341,38 @@ the detail for each command.""")
                         help="actually upload; without this it only reports "
                              "what it would do")
 
+    move = sub("move", "move items from one playlist to another", """\
+  meural.py move --from 2 --to 5
+      dry run: what would leave playlist 2 and join playlist 5
+
+  meural.py move --from 2 --to 5 --execute
+      do it
+
+  meural.py move --from o --to 5 --execute
+      sweep everything that is in no playlist into playlist 5
+
+  meural.py move --from 2 --to-new "Winter" --execute
+      empty playlist 2 into a playlist created for the purpose
+
+  meural.py move --from 2 --to 5 --copy --execute
+      add them to playlist 5 and leave playlist 2 as it was""")
+    move.add_argument("--from", dest="source", metavar="N",
+                      help="source: the playlist numbered N in `list`, or the "
+                           "letter o for the items in no playlist")
+    destination = move.add_mutually_exclusive_group()
+    destination.add_argument("--to", dest="destination", type=int, metavar="N",
+                             help="destination: the playlist numbered N in "
+                                  "`list`")
+    destination.add_argument("--to-new", dest="to_new", metavar="NAME",
+                             help="create a playlist called NAME and move into "
+                                  "that")
+    move.add_argument("--copy", action="store_true",
+                      help="leave the items in the source playlist too, rather "
+                           "than removing them once they have arrived")
+    move.add_argument("--execute", action="store_true",
+                      help="actually move; without this it only reports what "
+                           "it would do. No image is deleted either way")
+
     delete = sub("delete", "remove items", """\
   meural.py delete --orphans
       dry run: what is sitting outside every playlist
@@ -1216,6 +1419,7 @@ COMMANDS = {
     "diagnose": cmd_diagnose,
     "export": cmd_export,
     "upload": cmd_upload,
+    "move": cmd_move,
     "delete": cmd_delete,
 }
 

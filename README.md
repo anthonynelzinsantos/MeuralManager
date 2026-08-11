@@ -2,7 +2,7 @@
 
 **Manage your Netgear Meural library from the command line**
 
-The Meural app and web interface make bulk work painful. There’s no way to delete many items at once, deleting a playlist silently leaves its contents behind, and uploads are slow and unreliable. The script fixes all three problems.
+The Meural app and web interface make bulk work painful. There’s no way to delete many items at once, deleting a playlist silently leaves its contents behind, moving items from a playlist to another is torture, and uploads are slow and unreliable. The script fixes all four problems.
 
 ## Installation
 
@@ -146,6 +146,45 @@ python3 meural.py upload a.jpg b.jpg --playlist 3 --device 12345 --execute
 
 **Duplicate detection.** Compares your filenames against the `name` field of existing items. This is a reasonable guess at how Meural derives names, not a certainty. Use `--allow-duplicates` if it skips things it shouldn’t.
 
+### move
+
+Moves items between playlists without re-uploading them. A source and a destination are both required.
+
+| Flag | Meaning |
+|---|---|
+| `--from N` | Source: playlist `N`, or `o` for the items in no playlist. |
+| `--to N` | Destination: playlist `N`. Mutually exclusive with `--to-new`. |
+| `--to-new NAME` | Create a playlist called `NAME` and move into that. |
+| `--copy` | Leave the items in the source playlist as well. |
+| `--execute` | Actually move. Without it, nothing changes. |
+
+```bash
+# what would leave playlist 2 and join playlist 5?
+python3 meural.py move --from 2 --to 5
+
+# do it
+python3 meural.py move --from 2 --to 5 --execute
+
+# sweep everything that is in no playlist into playlist 5
+python3 meural.py move --from o --to 5 --execute
+
+# empty playlist 2 into a playlist created for the purpose
+python3 meural.py move --from 2 --to-new "Winter" --execute
+
+# add them to playlist 5 and leave playlist 2 as it was
+python3 meural.py move --from 2 --to 5 --copy --execute
+```
+
+**Nothing is deleted.** A move changes playlist membership only, through the same endpoint pair `upload` uses to file a new image: the item is added to the destination and detached from the source. The pictures themselves are untouched, which is why `move` needs only `--execute` and never asks you to type `DELETE`. Moving them back undoes it.
+
+**Order matters.** Each item is added to the destination first, and removed from the source only once that has been confirmed. If a run is interrupted or a call fails, the item is left in both playlists — visible in `list`, harmless, and cleared by re-running the same command. The reverse order would risk leaving an item in neither, which is how items become orphans.
+
+**Re-running is safe.** There is no state file: the script re-reads your playlists each time, skips items already at the destination, and picks up where it stopped. An interrupted move needs nothing more than the same command again.
+
+**`--from o`.** The orphans row in `list` is a source like any other, so uploads that ended up outside every playlist can be filed rather than deleted. Since an orphan belongs to no playlist, there is nothing to detach it from, and `--copy` makes no difference here.
+
+**Items that aren’t yours.** A playlist can hold Meural’s own artwork alongside your uploads — the difference between the `items` and `yours` columns in `list`. Those move exactly the same way. If the API refuses one, the add fails and the item stays put in the source.
+
 ### delete
 
 Exactly one target flag is required.
@@ -205,6 +244,19 @@ python3 meural.py delete --wipe --drop-playlists --execute
 ```bash
 python3 meural.py delete --playlist 2 --execute
 python3 meural.py upload ~/Pictures/autumn --playlist 2 --resize --execute
+```
+
+**Reorganise without re-uploading**
+
+```bash
+python3 meural.py move --from 2 --to-new "Winter"
+python3 meural.py move --from 2 --to-new "Winter" --execute
+```
+
+**Rescue uploads that missed their playlist**
+
+```bash
+python3 meural.py move --from o --to 1 --execute
 ```
 
 **Move a folder onto the frame immediately**
@@ -294,7 +346,7 @@ If retries fire constantly rather than occasionally, the backend is struggling a
 
 **Uploads time out repeatedly.** Try `--resize`, then raise `WRITE_DELAY`.
 
-**`N item(s) uploaded but not confirmed in the playlist`.** The upload succeeded but the playlist call could not be verified, so those items may be orphaned. Run `delete --orphans` to check, clear them, and upload again.
+**`N item(s) uploaded but not confirmed in the playlist`.** The upload succeeded but the playlist call could not be verified, so those items may be orphaned. Run `list` to see whether the orphans row has grown. `move --from o --to N --execute` files them where they should have gone; `delete --orphans --execute` clears them so you can upload again.
 
 **`Nothing to do` from `delete --orphans`.** Every item genuinely is in a playlist. Nothing is wrong; there is simply nothing to reclaim.
 
@@ -307,6 +359,7 @@ If retries fire constantly rather than occasionally, the backend is struggling a
 Meural publishes no supported public API, so parts of this are inferred from observed behaviour and third-party integrations. Specifically:
 
 - Item upload, playlist membership and deletion are attested by working third-party code.
+- Adding an item to a playlist and removing one from it are both documented in the published Meural REST API Postman collection, as `POST` and `DELETE` on `/galleries/:galleryId/items/:itemId`. `move` is those two calls in that order.
 - Playlist creation and the device listing are inferred from REST conventions. Both print their raw response so you can see what actually came back.
 - The image-URL field used by `export --download` is guessed from several plausible names; `diagnose` shows the real ones.
 
